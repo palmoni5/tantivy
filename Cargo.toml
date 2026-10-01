@@ -143,7 +143,7 @@ mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
 
 lz4-compression = ["lz4_flex"]
-zstd-compression = ["zstd"]
+zstd-compression = ["zstd", "zstd/zdict_builder"]
 
 # enable zstd-compression in columnar (and sstable)
 columnar-zstd-compression = ["columnar/zstd-compression"]

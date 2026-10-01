@@ -81,7 +81,7 @@ impl SegmentPlugin for StorePlugin {
                     // avoid creating many small blocks in the doc store. Once we have 5 full blocks,
                     // we start stacking. In the worst case 2/7 of the blocks would be very small.
                     || store_reader.block_checkpoints().take(7).count() < 6
-                    || store_reader.decompressor() != store_writer.compressor().into()
+                    || !store_writer.compressor().can_stack(store_reader.decompressor())
                 {
                     for doc_bytes_res in store_reader.iter_raw(reader.alive_bitset()) {
                         let doc_bytes = doc_bytes_res?;

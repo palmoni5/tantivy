@@ -460,7 +460,7 @@ where R: Read
                 let timestamp_micros = <i64 as BinarySerializable>::deserialize(self.reader)?;
                 Ok(DateTime::from_timestamp_micros(timestamp_micros))
             }
-            DocStoreVersion::V2 => {
+            DocStoreVersion::V2 | DocStoreVersion::V3 => {
                 let timestamp_nanos = <i64 as BinarySerializable>::deserialize(self.reader)?;
                 Ok(DateTime::from_timestamp_nanos(timestamp_nanos))
             }

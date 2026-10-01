@@ -2,6 +2,8 @@ use std::io;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::Decompressor;
+
 /// Compressor can be used on `IndexSettings` to choose
 /// the compressor used to compress the doc store.
 ///
@@ -77,14 +79,49 @@ impl<'de> Deserialize<'de> for Compressor {
 }
 
 #[derive(Clone, Default, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
-/// The Zstd compressor, with optional compression level.
+/// The Zstd compressor, with optional compression level and dictionary size.
+///
+/// String form (as used in `meta.json`): `zstd`, `zstd(compression_level=5)`,
+/// `zstd(dict_size=65536)` or `zstd(compression_level=5,dict_size=65536)`.
 pub struct ZstdCompressor {
     /// The compression level, if unset defaults to zstd::DEFAULT_COMPRESSION_LEVEL = 3
     pub compression_level: Option<i32>,
+    /// Maximum size in bytes of a zstd dictionary trained for each doc store.
+    ///
+    /// When set, every doc store trains a dictionary on its first blocks, embeds it in the
+    /// `.store` file and compresses all its blocks with it. This mostly helps small blocks and
+    /// small documents. Stores that are too small, or for which the dictionary does not help,
+    /// silently fall back to plain zstd blocks.
+    ///
+    /// Doc stores compressed with a dictionary cannot be stacked during merges: their documents
+    /// are recompressed. Readers older than the version introducing this option cannot open
+    /// such stores.
+    ///
+    /// Must be within `[ZstdCompressor::MIN_DICT_SIZE, ZstdCompressor::MAX_DICT_SIZE]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dict_size: Option<usize>,
 }
 
 #[cfg(feature = "zstd-compression")]
 impl ZstdCompressor {
+    /// Smallest accepted value for [`ZstdCompressor::dict_size`].
+    pub const MIN_DICT_SIZE: usize = 256;
+    /// Largest accepted value for [`ZstdCompressor::dict_size`].
+    pub const MAX_DICT_SIZE: usize = 1 << 20;
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(dict_size) = self.dict_size {
+            if !(Self::MIN_DICT_SIZE..=Self::MAX_DICT_SIZE).contains(&dict_size) {
+                return Err(format!(
+                    "zstd dict_size must be within [{}, {}], got {dict_size}",
+                    Self::MIN_DICT_SIZE,
+                    Self::MAX_DICT_SIZE
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn deser_from_str(val: &str) -> Result<ZstdCompressor, String> {
         if !val.starts_with("zstd") {
             return Err(format!("needs to start with zstd, but got {val}"));
@@ -117,18 +154,32 @@ impl ZstdCompressor {
                     }
                     compressor.compression_level = Some(value);
                 }
+                "dict_size" => {
+                    let value = value.parse::<usize>().map_err(|err| {
+                        format!("Could not parse value {value} of option {opt_name}, e: {err}")
+                    })?;
+                    compressor.dict_size = Some(value);
+                }
                 _ => {
                     return Err(format!("unknown zstd option {opt_name:?}"));
                 }
             }
         }
+        compressor.validate()?;
         Ok(compressor)
     }
     fn ser_to_string(&self) -> String {
+        let mut options = Vec::new();
         if let Some(compression_level) = self.compression_level {
-            format!("zstd(compression_level={compression_level})")
-        } else {
+            options.push(format!("compression_level={compression_level}"));
+        }
+        if let Some(dict_size) = self.dict_size {
+            options.push(format!("dict_size={dict_size}"));
+        }
+        if options.is_empty() {
             "zstd".to_string()
+        } else {
+            format!("zstd({})", options.join(","))
         }
     }
 }
@@ -147,6 +198,26 @@ impl Default for Compressor {
 }
 
 impl Compressor {
+    /// Returns true if the raw blocks of a doc store using `decompressor` can be copied as is
+    /// into a doc store written with this compressor.
+    ///
+    /// Dictionaries are trained per store, so blocks are never stacked into or out of a store
+    /// using a dictionary.
+    pub(crate) fn can_stack(&self, decompressor: Decompressor) -> bool {
+        !self.uses_dictionary()
+            && !decompressor.has_embedded_dictionary()
+            && decompressor == Decompressor::from(*self)
+    }
+
+    /// Returns true if doc stores written with this compressor embed a trained dictionary.
+    pub(crate) fn uses_dictionary(&self) -> bool {
+        match self {
+            #[cfg(feature = "zstd-compression")]
+            Self::Zstd(zstd_compressor) => zstd_compressor.dict_size.is_some(),
+            _ => false,
+        }
+    }
+
     #[inline]
     pub(crate) fn compress_into(
         &self,
@@ -179,6 +250,7 @@ mod tests {
     fn zstd_serde_roundtrip() {
         let compressor = ZstdCompressor {
             compression_level: Some(15),
+            dict_size: None,
         };
 
         assert_eq!(
@@ -204,7 +276,8 @@ mod tests {
         assert_eq!(
             ZstdCompressor::deser_from_str("zstd(compression_level=15)").unwrap(),
             ZstdCompressor {
-                compression_level: Some(15)
+                compression_level: Some(15),
+                dict_size: None,
             }
         );
         assert_eq!(
@@ -255,5 +328,59 @@ mod tests {
                 "{malformed:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn zstd_dict_size_serde() {
+        let both = ZstdCompressor {
+            compression_level: Some(3),
+            dict_size: Some(65_536),
+        };
+        assert_eq!(
+            both.ser_to_string(),
+            "zstd(compression_level=3,dict_size=65536)"
+        );
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(compression_level=3,dict_size=65536)").unwrap(),
+            both
+        );
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(dict_size=65536,compression_level=3)").unwrap(),
+            both
+        );
+        let dict_only = ZstdCompressor {
+            compression_level: None,
+            dict_size: Some(4096),
+        };
+        assert_eq!(dict_only.ser_to_string(), "zstd(dict_size=4096)");
+        assert_eq!(
+            ZstdCompressor::deser_from_str(&dict_only.ser_to_string()).unwrap(),
+            dict_only
+        );
+
+        let compressor: Compressor =
+            serde_json::from_str(r#""zstd(compression_level=3,dict_size=65536)""#).unwrap();
+        assert_eq!(compressor, Compressor::Zstd(both));
+        assert_eq!(
+            serde_json::to_string(&compressor).unwrap(),
+            r#""zstd(compression_level=3,dict_size=65536)""#
+        );
+    }
+
+    #[test]
+    fn zstd_dict_size_deser_errors() {
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(dict_size=100)").unwrap_err(),
+            "zstd dict_size must be within [256, 1048576], got 100"
+        );
+        assert!(ZstdCompressor::deser_from_str("zstd(dict_size=1048577)").is_err());
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(dict_size=-1)").unwrap_err(),
+            "Could not parse value -1 of option dict_size, e: invalid digit found in string"
+        );
+        assert_eq!(
+            ZstdCompressor::deser_from_str("zstd(compression_level=3,)").unwrap_err(),
+            "no '=' found in option \"\""
+        );
     }
 }

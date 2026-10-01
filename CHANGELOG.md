@@ -3,6 +3,11 @@ Tantivy 0.27.0
 
 ## Breaking change
 - `.set_fast(..)` now takes a &str. The same behavior as `.set_fast(None)` can be obtained with .set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME).
+- `ZstdCompressor` has a new public field `dict_size` (use `..Default::default()` in struct literals).
+- `Decompressor` has a new variant `ZstdDict` (with the `zstd-compression` feature).
+
+## Features/Improvements
+- Add an opt-in trained zstd dictionary for the doc store, e.g. `"docstore_compression": "zstd(compression_level=3,dict_size=65536)"`. Each doc store trains a dictionary on its first blocks and embeds it in the `.store` file; stores that are too small or do not benefit fall back to plain zstd blocks, byte-identical to stores written without `dict_size`. Doc stores using a dictionary are recompressed instead of stacked during merges. They are written with doc store version 3: older versions of tantivy return an error when opening them.
 
 
 Tantivy 0.26.2

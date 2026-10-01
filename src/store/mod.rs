@@ -6,6 +6,8 @@
 //! Internally, documents (or rather their stored fields) are serialized to a buffer.
 //! When the buffer exceeds `block_size` (defaults to 16K), the buffer is compressed
 //! using LZ4 or Zstd and the resulting block is written to disk.
+//! Zstd can optionally use a dictionary trained on the first blocks of each store and embedded
+//! in it (see [`ZstdCompressor::dict_size`]).
 //!
 //! One can then request for a specific `DocId`.
 //! A skip list helps navigating to the right block,
@@ -46,6 +48,9 @@ pub use self::writer::StoreWriter;
 mod store_compressor;
 
 /// Doc store version in footer to handle format changes.
+///
+/// Doc stores embedding a zstd dictionary are written with `DocStoreVersion::V3` instead, so that
+/// older versions of tantivy refuse to open them.
 pub(crate) const DOC_STORE_VERSION: DocStoreVersion = DocStoreVersion::V2;
 
 #[cfg(feature = "lz4-compression")]
@@ -53,6 +58,9 @@ mod compression_lz4_block;
 
 #[cfg(feature = "zstd-compression")]
 mod compression_zstd_block;
+
+#[cfg(all(test, feature = "zstd-compression"))]
+mod zstd_dict_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -6,9 +6,10 @@ use std::ops::{AddAssign, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{BinarySerializable, OwnedBytes};
+use common::{BinarySerializable, HasLen, OwnedBytes};
 use lru::LruCache;
 
+use super::decompressors::BlockDecompressor;
 use super::footer::DocStoreFooter;
 use super::index::SkipIndex;
 use super::Decompressor;
@@ -31,12 +32,15 @@ type Block = OwnedBytes;
 pub(crate) enum DocStoreVersion {
     V1 = 1,
     V2 = 2,
+    /// Same document encoding as `V2`, with a zstd dictionary embedded in the store.
+    V3 = 3,
 }
 impl Display for DocStoreVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DocStoreVersion::V1 => write!(f, "V1"),
             DocStoreVersion::V2 => write!(f, "V2"),
+            DocStoreVersion::V3 => write!(f, "V3"),
         }
     }
 }
@@ -49,6 +53,7 @@ impl BinarySerializable for DocStoreVersion {
         Ok(match u32::deserialize(reader)? {
             1 => DocStoreVersion::V1,
             2 => DocStoreVersion::V2,
+            3 => DocStoreVersion::V3,
             v => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -61,7 +66,7 @@ impl BinarySerializable for DocStoreVersion {
 
 /// Reads document off tantivy's [`Store`](./index.html)
 pub struct StoreReader {
-    decompressor: Decompressor,
+    block_decompressor: BlockDecompressor,
     doc_store_version: DocStoreVersion,
     data: FileSlice,
     skip_index: Arc<SkipIndex>,
@@ -157,13 +162,29 @@ impl StoreReader {
     pub fn open(store_file: FileSlice, cache_num_blocks: usize) -> io::Result<StoreReader> {
         let (footer, data_and_offset) = DocStoreFooter::extract_footer(store_file)?;
 
-        let (data_file, offset_index_file) = data_and_offset.split(footer.offset as usize);
-        let index_data = offset_index_file.read_bytes()?;
+        if footer.offset > data_and_offset.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc store footer offset is out of bounds",
+            ));
+        }
+        let (data_and_dict, offset_index_file) = data_and_offset.split(footer.offset as usize);
         let space_usage =
-            StoreSpaceUsage::new(data_file.num_bytes(), offset_index_file.num_bytes());
+            StoreSpaceUsage::new(data_and_dict.num_bytes(), offset_index_file.num_bytes());
+        // The embedded dictionary, if any, sits between the blocks and the skip index.
+        let dict_len = footer.dict_len as usize;
+        if dict_len > data_and_dict.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "doc store dictionary length is out of bounds",
+            ));
+        }
+        let (data_file, dict_file) = data_and_dict.split_from_end(dict_len);
+        let block_decompressor = BlockDecompressor::open(&footer, dict_file)?;
+        let index_data = offset_index_file.read_bytes()?;
         let skip_index = SkipIndex::open(index_data);
         Ok(StoreReader {
-            decompressor: footer.decompressor,
+            block_decompressor,
             doc_store_version: footer.doc_store_version,
             data: data_file,
             cache: BlockCache {
@@ -182,7 +203,7 @@ impl StoreReader {
     }
 
     pub(crate) fn decompressor(&self) -> Decompressor {
-        self.decompressor
+        self.block_decompressor.decompressor()
     }
 
     /// Returns the cache hit and miss statistics of the store reader.
@@ -218,8 +239,10 @@ impl StoreReader {
         }
 
         let compressed_block = self.get_compressed_block(checkpoint)?;
-        let decompressed_block =
-            OwnedBytes::new(self.decompressor.decompress(compressed_block.as_ref())?);
+        let decompressed_block = OwnedBytes::new(
+            self.block_decompressor
+                .decompress(compressed_block.as_ref())?,
+        );
 
         self.cache
             .put_into_cache(cache_key, decompressed_block.clone());
@@ -401,7 +424,7 @@ impl StoreReader {
             .read_bytes_async()
             .await?;
 
-        let decompressor = self.decompressor;
+        let decompressor = self.block_decompressor.clone();
         let maybe_decompressed_block = executor
             .spawn_blocking(move || decompressor.decompress(compressed_block.as_ref()))
             .await
@@ -460,6 +483,7 @@ mod tests {
     #[test]
     fn test_doc_store_version_ord() {
         assert!(DocStoreVersion::V1 < DocStoreVersion::V2);
+        assert!(DocStoreVersion::V2 < DocStoreVersion::V3);
     }
 
     #[test]
