@@ -722,3 +722,267 @@ fn test_memory_budget_accounts_for_dictionary_sample() -> crate::Result<()> {
     assert!(num_segments[1] > 1, "{num_segments:?}");
     Ok(())
 }
+
+// --- Robustness --------------------------------------------------------------------------
+
+#[test]
+fn test_store_zstd_dict_is_deterministic_and_thread_independent() {
+    let reference = write_store(zstd_dict(None, DICT_SIZE), 1_000, false);
+    assert_eq!(footer(&reference).decompressor, Decompressor::ZstdDict);
+    for separate_thread in [false, true] {
+        let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, separate_thread);
+        assert_eq!(store_bytes.as_slice(), reference.as_slice());
+    }
+}
+
+#[test]
+fn test_store_zstd_dict_degenerate_inputs() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let bytes_field = schema_builder.add_bytes_field("bytes", STORED);
+    let schema = schema_builder.build();
+    let cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        // Zero entropy: training may fail or produce a useless dictionary.
+        ("zeros", (0..2_000).map(|_| vec![0u8; 500]).collect()),
+        // One block much bigger than the sample target.
+        (
+            "one_huge_doc",
+            vec![(0..3_000_000u32)
+                .map(|i| b"abcdefghij klmnop"[(i.wrapping_mul(2_654_435_761) >> 28) as usize])
+                .collect()],
+        ),
+        ("empty_docs", (0..50_000).map(|_| Vec::new()).collect()),
+    ];
+    for (name, docs) in cases {
+        for separate_thread in [false, true] {
+            let directory = RamDirectory::create();
+            let path = Path::new("store");
+            let mut writer = StoreWriter::new(
+                directory.open_write(path)?,
+                zstd_dict(None, DICT_SIZE),
+                BLOCK_SIZE,
+                separate_thread,
+            )?;
+            for bytes in &docs {
+                let mut doc = TantivyDocument::default();
+                doc.add_bytes(bytes_field, bytes);
+                writer.store(&doc, &schema)?;
+            }
+            writer.close()?;
+            let reader = StoreReader::open(directory.open_read(path)?, 0)?;
+            for (doc_id, bytes) in docs.iter().enumerate().step_by(37) {
+                let doc: TantivyDocument = reader.get(doc_id as u32)?;
+                let stored = doc
+                    .get_first(bytes_field)
+                    .and_then(|value| value.as_bytes())
+                    .unwrap_or(&[]);
+                assert_eq!(stored, &bytes[..], "{name} doc {doc_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Opens and reads the raw bytes of all documents of a possibly corrupted store. Returns true if
+/// it panicked.
+fn read_everything_panics(bytes: Vec<u8>, num_docs: u32) -> bool {
+    std::panic::catch_unwind(|| {
+        let Ok(reader) = StoreReader::open(FileSlice::from(bytes), 0) else {
+            return;
+        };
+        for doc_id in 0..num_docs {
+            let _ = reader.get_document_bytes(doc_id);
+        }
+        for doc_bytes in reader.iter_raw(None) {
+            let _ = doc_bytes;
+        }
+    })
+    .is_err()
+}
+
+#[test]
+fn test_store_zstd_dict_footer_sweep_never_panics() {
+    let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, true);
+    let original = footer(&store_bytes);
+    let footer_start = store_bytes.len() - DocStoreFooter::SIZE_IN_BYTES;
+    let mut panics = Vec::new();
+    let dict_lens = (0..=original.offset as u32 + 64).step_by(97).chain([
+        u32::MAX,
+        u32::MAX - 1,
+        original.offset as u32 + 1,
+    ]);
+    for dict_len in dict_lens {
+        let mut bytes = store_bytes.to_vec();
+        bytes[footer_start + 13..footer_start + 17].copy_from_slice(&dict_len.to_le_bytes());
+        if read_everything_panics(bytes, 1_000) {
+            panics.push(format!("dict_len={dict_len}"));
+        }
+    }
+    for offset in [
+        u64::MAX,
+        u64::MAX / 2,
+        footer_start as u64 + 1,
+        1 << 32,
+        0,
+        1,
+    ] {
+        let mut bytes = store_bytes.to_vec();
+        bytes[footer_start + 4..footer_start + 12].copy_from_slice(&offset.to_le_bytes());
+        if read_everything_panics(bytes, 1_000) {
+            panics.push(format!("offset={offset}"));
+        }
+    }
+    assert!(panics.is_empty(), "panics: {panics:?}");
+}
+
+/// Thanks to the dictionary checksum, a corrupted dictionary never decodes into wrong documents.
+#[test]
+fn test_store_zstd_dict_bit_flips_are_detected() -> crate::Result<()> {
+    let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, true);
+    let dict_end = footer(&store_bytes).offset as usize;
+    let dict_start = dict_end - footer(&store_bytes).dict_len as usize;
+    for pos in (dict_start..dict_end).step_by(7) {
+        let mut bytes = store_bytes.to_vec();
+        bytes[pos] ^= 0xFF;
+        let Ok(reader) = StoreReader::open(FileSlice::from(bytes), 0) else {
+            continue;
+        };
+        for doc_id in (0..1_000).step_by(101) {
+            assert!(
+                reader.get_document_bytes(doc_id).is_err(),
+                "dictionary byte {} flipped",
+                pos - dict_start
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Truncated stores and corrupted blocks: a store with a dictionary does not panic more often
+/// than a plain zstd store (block parsing has pre-existing panics on corrupted data).
+#[test]
+fn test_store_zstd_dict_truncation_and_block_flips() {
+    let mut panics = Vec::new();
+    for compressor in [
+        Compressor::Zstd(ZstdCompressor::default()),
+        zstd_dict(None, DICT_SIZE),
+    ] {
+        let store_bytes = write_store(compressor, 300, true);
+        let len = store_bytes.len();
+        let mut num_panics = 0;
+        for cut in (0..len).step_by(len / 200).chain(len - 64..len) {
+            if read_everything_panics(store_bytes.as_slice()[..cut].to_vec(), 300) {
+                num_panics += 1;
+            }
+        }
+        let blocks_end =
+            footer(&store_bytes).offset as usize - footer(&store_bytes).dict_len as usize;
+        for pos in (0..blocks_end).step_by(blocks_end / 300 + 1) {
+            let mut bytes = store_bytes.to_vec();
+            bytes[pos] ^= 0x5A;
+            if read_everything_panics(bytes, 300) {
+                num_panics += 1;
+            }
+        }
+        panics.push(num_panics);
+    }
+    assert!(panics[1] <= panics[0], "plain zstd, dictionary: {panics:?}");
+}
+
+#[test]
+fn test_store_zstd_dict_concurrent_reads() {
+    let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, true);
+    let reader = std::sync::Arc::new(StoreReader::open(file(&store_bytes), 0).unwrap());
+    let title = lorem_schema().get_field("title").unwrap();
+    let handles: Vec<_> = (0..16u32)
+        .map(|thread_id| {
+            let reader = reader.clone();
+            std::thread::spawn(move || {
+                for i in 0..1_000u32 {
+                    let doc_id = (i * 7 + thread_id * 13) % 1_000;
+                    let doc: TantivyDocument = reader.get(doc_id).unwrap();
+                    assert_eq!(
+                        doc.get_first(title).unwrap().as_str(),
+                        Some(&*format!("Doc {doc_id}"))
+                    );
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+#[cfg(feature = "quickwit")]
+#[test]
+fn test_store_zstd_dict_async_read() -> crate::Result<()> {
+    let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, true);
+    let reader = StoreReader::open(file(&store_bytes), 0)?;
+    assert_eq!(reader.decompressor(), Decompressor::ZstdDict);
+    let executor = crate::Executor::single_thread();
+    for doc_id in (0..1_000u32).step_by(53) {
+        let async_bytes =
+            futures::executor::block_on(reader.get_document_bytes_async(doc_id, &executor))?;
+        assert_eq!(async_bytes, reader.get_document_bytes(doc_id)?);
+    }
+    Ok(())
+}
+
+/// Sorted indexes write the doc store through a temporary store and remap it, and merges
+/// reorder documents.
+#[test]
+#[allow(deprecated)]
+fn test_sorted_index_with_dictionary() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let id_field = schema_builder.add_u64_field("id", INDEXED | STORED | crate::schema::FAST);
+    let body_field = schema_builder.add_text_field("body", STORED);
+    let index = Index::builder()
+        .schema(schema_builder.build())
+        .settings(IndexSettings {
+            sort_by_field: Some(crate::index::IndexSortByField {
+                field: "id".to_string(),
+                order: crate::index::Order::Desc,
+            }),
+            docstore_compression: zstd_dict(None, DICT_SIZE),
+            docstore_blocksize: BLOCK_SIZE,
+            ..Default::default()
+        })
+        .create_in_ram()?;
+    {
+        let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        for segment in 0..3u64 {
+            // Interleave ids across segments, so that the merge really reorders documents.
+            for i in 0..DOCS_PER_SEGMENT {
+                let id = i * 3 + segment;
+                index_writer.add_document(doc!(id_field => id, body_field => body_for(id)))?;
+            }
+            index_writer.commit()?;
+        }
+    }
+    let check = |expected_num_segments: usize| -> crate::Result<()> {
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), expected_num_segments);
+        for segment_reader in searcher.segment_readers() {
+            let store = segment_reader.get_store_reader(0)?;
+            assert_eq!(store.decompressor(), Decompressor::ZstdDict);
+            let ids = segment_reader.fast_fields().u64("id")?;
+            let mut previous = u64::MAX;
+            for doc_id in 0..segment_reader.max_doc() {
+                let doc: TantivyDocument = store.get(doc_id)?;
+                let id = doc.get_first(id_field).unwrap().as_u64().unwrap();
+                assert_eq!(ids.first(doc_id), Some(id));
+                assert_eq!(
+                    doc.get_first(body_field).unwrap().as_str(),
+                    Some(&*body_for(id))
+                );
+                assert!(id <= previous);
+                previous = id;
+            }
+        }
+        Ok(())
+    };
+    check(3)?;
+    merge_all(&index)?;
+    check(1)
+}
