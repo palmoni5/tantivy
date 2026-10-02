@@ -1,4 +1,5 @@
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
 use common::OwnedBytes;
@@ -134,8 +135,13 @@ impl ZstdDictEncoder {
     }
 }
 
-/// Maximum number of idle decompression contexts kept by a `ZstdDictDecoder`.
-const MAX_POOLED_DCTX: usize = 4;
+/// Maximum number of idle decompression contexts kept by a `ZstdDictDecoder` (~95 KB each):
+/// one per available core. Contexts are only created when concurrent reads need them.
+fn max_pooled_dctx() -> usize {
+    static MAX_POOLED_DCTX: OnceLock<usize> = OnceLock::new();
+    *MAX_POOLED_DCTX
+        .get_or_init(|| std::thread::available_parallelism().map_or(4, NonZeroUsize::get))
+}
 
 /// Dictionary used to decompress the blocks of one doc store.
 ///
@@ -200,7 +206,7 @@ impl ZstdDictDecoder {
                 .map_err(|code| zstd_error(io::ErrorKind::InvalidData, code))
         });
         let mut dctx_pool = self.dctx_pool.lock().unwrap();
-        if dctx_pool.len() < MAX_POOLED_DCTX {
+        if dctx_pool.len() < max_pooled_dctx() {
             dctx_pool.push(dctx);
         }
         result
