@@ -239,7 +239,10 @@ fn test_store_zstd_dict_corruptions() -> crate::Result<()> {
     let mut bad_content = store_bytes.to_vec();
     let dict_start = footer(&store_bytes).offset as usize - dict.len();
     bad_content[dict_start + dict.len() / 2] ^= 0xFF;
-    assert!(StoreReader::open(FileSlice::from(bad_content), 0).is_err());
+    let store = StoreReader::open(FileSlice::from(bad_content), 0)?;
+    let err = store.get::<TantivyDocument>(0).unwrap_err().to_string();
+    assert!(err.contains("checksum mismatch"), "{err}");
+    assert!(store.get::<TantivyDocument>(1).is_err());
 
     // Corrupted magic number.
     let mut bad_magic = dict.clone();
@@ -267,6 +270,19 @@ fn test_store_zstd_dict_corruptions() -> crate::Result<()> {
     let store = StoreReader::open(file(&wrong_dict), 0)?;
     assert!(store.get::<TantivyDocument>(0).is_err());
     assert!(store.iter::<TantivyDocument>(None).any(|doc| doc.is_err()));
+    Ok(())
+}
+
+#[test]
+fn test_store_zstd_dict_is_prepared_lazily() -> crate::Result<()> {
+    let store_bytes = write_store(zstd_dict(None, DICT_SIZE), 1_000, true);
+    let store = StoreReader::open(file(&store_bytes), 10)?;
+    assert_eq!(store.decompressor(), Decompressor::ZstdDict);
+    store.space_usage();
+    assert!(store.block_checkpoints().count() > 1);
+    assert!(!store.is_zstd_dict_prepared());
+    let _doc: TantivyDocument = store.get(0)?;
+    assert!(store.is_zstd_dict_prepared());
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use common::OwnedBytes;
 use zstd::bulk::{compress_to_buffer, decompress_to_buffer};
@@ -137,18 +137,21 @@ impl ZstdDictEncoder {
 /// Maximum number of idle decompression contexts kept by a `ZstdDictDecoder`.
 const MAX_POOLED_DCTX: usize = 4;
 
-/// Prepared (digested) dictionary used to decompress the blocks of one doc store.
+/// Dictionary used to decompress the blocks of one doc store.
 ///
-/// It is parsed once when the store is opened and shared by all reads. Decompression contexts
-/// are reused: zstd switches to a slower, prefetching decoder whenever a context sees a
-/// dictionary for the first time.
+/// The dictionary is only prepared (digested into a `DDict`) on the first decompression, so
+/// that opening a store stays cheap, and then shared by all reads. Decompression contexts are
+/// reused: zstd switches to a slower, prefetching decoder whenever a context sees a dictionary
+/// for the first time.
 pub struct ZstdDictDecoder {
-    ddict: DDict<'static>,
+    dict: OwnedBytes,
+    checksum: u32,
+    ddict: OnceLock<Result<DDict<'static>, String>>,
     dctx_pool: Mutex<Vec<DCtx<'static>>>,
 }
 
 impl ZstdDictDecoder {
-    /// `checksum` is the CRC32 of `dict`.
+    /// `checksum` is the CRC32 of `dict`. It is verified when the dictionary is prepared.
     pub fn open(dict: OwnedBytes, checksum: u32) -> io::Result<Self> {
         // Frames record the id of the dictionary they were compressed with, so requiring a
         // proper zstd dictionary (with an id) turns a wrong dictionary into a decoding error.
@@ -158,25 +161,34 @@ impl ZstdDictDecoder {
                 "doc store zstd dictionary is corrupted (missing magic number or dictionary id)",
             ));
         }
-        if crc32fast::hash(&dict) != checksum {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "doc store zstd dictionary is corrupted (checksum mismatch)",
-            ));
-        }
-        let ddict = DDict::try_create(&dict).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "doc store zstd dictionary is corrupted",
-            )
-        })?;
         Ok(ZstdDictDecoder {
-            ddict,
+            dict,
+            checksum,
+            ddict: OnceLock::new(),
             dctx_pool: Mutex::new(Vec::new()),
         })
     }
 
+    fn ddict(&self) -> io::Result<&DDict<'static>> {
+        self.ddict
+            .get_or_init(|| {
+                if crc32fast::hash(&self.dict) != self.checksum {
+                    return Err("doc store zstd dictionary is corrupted (checksum mismatch)".into());
+                }
+                DDict::try_create(&self.dict)
+                    .ok_or_else(|| "doc store zstd dictionary is corrupted".into())
+            })
+            .as_ref()
+            .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg.clone()))
+    }
+
+    #[cfg(test)]
+    pub fn is_prepared(&self) -> bool {
+        self.ddict.get().is_some()
+    }
+
     pub fn decompress(&self, compressed: &[u8], decompressed: &mut Vec<u8>) -> io::Result<()> {
+        let ddict = self.ddict()?;
         let pooled_dctx = self.dctx_pool.lock().unwrap().pop();
         let mut dctx = match pooled_dctx {
             Some(dctx) => dctx,
@@ -184,7 +196,7 @@ impl ZstdDictDecoder {
                 .ok_or_else(|| io::Error::other("failed to create zstd decompression context"))?,
         };
         let result = decompress_with(compressed, decompressed, |src, dst| {
-            dctx.decompress_using_ddict(dst, src, &self.ddict)
+            dctx.decompress_using_ddict(dst, src, ddict)
                 .map_err(|code| zstd_error(io::ErrorKind::InvalidData, code))
         });
         let mut dctx_pool = self.dctx_pool.lock().unwrap();

@@ -145,6 +145,14 @@ impl BlockDecompressor {
         self.decompressor
     }
 
+    /// Returns true if the zstd dictionary of the store has been prepared for decompression.
+    #[cfg(all(test, feature = "zstd-compression"))]
+    pub(crate) fn is_zstd_dict_prepared(&self) -> bool {
+        self.zstd_dict
+            .as_ref()
+            .is_some_and(|zstd_dict| zstd_dict.is_prepared())
+    }
+
     pub(crate) fn decompress(&self, compressed_block: &[u8]) -> io::Result<Vec<u8>> {
         #[cfg(feature = "zstd-compression")]
         if let Some(zstd_dict) = &self.zstd_dict {
