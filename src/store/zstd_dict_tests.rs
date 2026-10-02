@@ -401,7 +401,8 @@ fn add_segments(
     segments: std::ops::Range<u64>,
     num_docs: u64,
 ) -> crate::Result<()> {
-    let mut index_writer: IndexWriter = index.writer_for_tests()?;
+    // Big enough for the dictionary sample: segments are only flushed on commit.
+    let mut index_writer: IndexWriter = index.writer_with_num_threads(1, 50_000_000)?;
     index_writer.set_merge_policy(Box::new(NoMergePolicy));
     for segment in segments {
         for id in segment * 10_000..segment * 10_000 + num_docs {
@@ -593,4 +594,115 @@ fn test_zstd_dict_settings_serde() {
     assert!(json.contains(r#""docstore_compression":"zstd(compression_level=3,dict_size=65536)""#));
     let deserialized: IndexSettings = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, settings);
+}
+
+// --- Memory accounting -------------------------------------------------------------------
+
+/// Stores `body_for` documents in all `writers` until `*num_bytes` reaches `until`.
+fn store_docs_until(
+    writers: &mut [&mut StoreWriter],
+    schema: &Schema,
+    next_id: &mut u64,
+    num_bytes: &mut usize,
+    until: usize,
+) -> crate::Result<()> {
+    let body = schema.get_field("body").unwrap();
+    while *num_bytes < until {
+        let text = body_for(*next_id);
+        *next_id += 1;
+        *num_bytes += text.len();
+        let mut doc = TantivyDocument::default();
+        doc.add_text(body, text);
+        for writer in writers.iter_mut() {
+            writer.store(&doc, schema)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_store_writer_mem_usage_accounts_for_dictionary_sample() -> crate::Result<()> {
+    // The sample target is 100 * 65_536 bytes; training becomes possible from 10 * 65_536.
+    const DICT_SIZE: usize = 65_536;
+    // Blocks queued for, or being compressed by, the dedicated thread are not accounted for.
+    const NOT_ACCOUNTED: usize = 6 * BLOCK_SIZE;
+    let schema = lorem_schema();
+    let directory = RamDirectory::create();
+    for separate_thread in [false, true] {
+        let mut dict_writer = StoreWriter::new(
+            directory.open_write(Path::new(&format!("dict{separate_thread}")))?,
+            zstd_dict(None, DICT_SIZE),
+            BLOCK_SIZE,
+            separate_thread,
+        )?;
+        let mut plain_writer = StoreWriter::new(
+            directory.open_write(Path::new(&format!("plain{separate_thread}")))?,
+            Compressor::Zstd(ZstdCompressor::default()),
+            BLOCK_SIZE,
+            separate_thread,
+        )?;
+        let (mut next_id, mut num_bytes) = (0, 0);
+        store_docs_until(
+            &mut [&mut dict_writer, &mut plain_writer],
+            &schema,
+            &mut next_id,
+            &mut num_bytes,
+            2 << 20,
+        )?;
+        // The sample, and the memory reserved to train the dictionary on it.
+        assert!(
+            dict_writer.mem_usage() >= num_bytes - NOT_ACCOUNTED + (10 << 20),
+            "{} for {num_bytes} bytes",
+            dict_writer.mem_usage()
+        );
+        assert!(plain_writer.mem_usage() < 4 * BLOCK_SIZE);
+
+        // Once the sample is complete, only the encoder remains.
+        store_docs_until(
+            &mut [&mut dict_writer, &mut plain_writer],
+            &schema,
+            &mut next_id,
+            &mut num_bytes,
+            100 * DICT_SIZE + NOT_ACCOUNTED + 2 * BLOCK_SIZE,
+        )?;
+        assert!(
+            dict_writer.mem_usage() < 2 << 20,
+            "{}",
+            dict_writer.mem_usage()
+        );
+        dict_writer.close()?;
+        plain_writer.close()?;
+        let store_bytes = directory
+            .open_read(Path::new(&format!("dict{separate_thread}")))?
+            .read_bytes()?;
+        assert_eq!(footer(&store_bytes).decompressor, Decompressor::ZstdDict);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_memory_budget_accounts_for_dictionary_sample() -> crate::Result<()> {
+    let mut num_segments = Vec::new();
+    for compressor in [
+        Compressor::Zstd(ZstdCompressor::default()),
+        zstd_dict(None, 65_536),
+    ] {
+        let (index, id_field, body_field) = merge_test_index(compressor)?;
+        let mut index_writer: IndexWriter = index.writer_with_num_threads(
+            1,
+            crate::indexer::index_writer::MEMORY_BUDGET_NUM_BYTES_MIN,
+        )?;
+        index_writer.set_merge_policy(Box::new(NoMergePolicy));
+        // About 3 MB of stored text.
+        for id in 0..15_000 {
+            index_writer.add_document(doc!(id_field => id, body_field => body_for(id)))?;
+        }
+        index_writer.commit()?;
+        num_segments.push(index.searchable_segment_ids()?.len());
+    }
+    // The 15 MB budget holds the documents and the plain doc store, but not the dictionary
+    // sample plus the memory needed to train on it.
+    assert_eq!(num_segments[0], 1);
+    assert!(num_segments[1] > 1, "{num_segments:?}");
+    Ok(())
 }

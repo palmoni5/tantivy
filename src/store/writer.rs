@@ -54,7 +54,9 @@ impl StoreWriter {
 
     /// The memory used (inclusive childs)
     pub fn mem_usage(&self) -> usize {
-        self.current_block.capacity() + self.doc_pos.capacity() * std::mem::size_of::<u32>()
+        self.current_block.capacity()
+            + self.doc_pos.capacity() * std::mem::size_of::<u32>()
+            + self.block_compressor.mem_usage()
     }
 
     /// Checks if the current block is full, and if so, compresses and flushes it.

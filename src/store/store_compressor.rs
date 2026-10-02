@@ -1,5 +1,7 @@
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{io, thread};
 
@@ -14,7 +16,11 @@ use crate::store::index::{Checkpoint, SkipIndexBuilder};
 use crate::store::{Compressor, Decompressor, StoreReader};
 use crate::DocId;
 
-pub struct BlockCompressor(BlockCompressorVariants);
+pub struct BlockCompressor {
+    variants: BlockCompressorVariants,
+    /// Memory held by the compressor, updated by the thread doing the compression.
+    mem_usage: Arc<AtomicUsize>,
+}
 
 // The struct wrapping an enum is just here to keep the
 // impls private.
@@ -26,17 +32,24 @@ enum BlockCompressorVariants {
 impl BlockCompressor {
     pub fn new(compressor: Compressor, wrt: WritePtr, dedicated_thread: bool) -> io::Result<Self> {
         let block_compressor_impl = BlockCompressorImpl::new(compressor, wrt)?;
-        if dedicated_thread {
-            let dedicated_thread_compressor =
-                DedicatedThreadBlockCompressorImpl::new(block_compressor_impl)?;
-            Ok(BlockCompressor(BlockCompressorVariants::DedicatedThread(
-                dedicated_thread_compressor,
-            )))
-        } else {
-            Ok(BlockCompressor(BlockCompressorVariants::SameThread(
+        let mem_usage = block_compressor_impl.mem_usage.clone();
+        let variants = if dedicated_thread {
+            BlockCompressorVariants::DedicatedThread(DedicatedThreadBlockCompressorImpl::new(
                 block_compressor_impl,
-            )))
-        }
+            )?)
+        } else {
+            BlockCompressorVariants::SameThread(block_compressor_impl)
+        };
+        Ok(BlockCompressor {
+            variants,
+            mem_usage,
+        })
+    }
+
+    /// Memory held by the compressor itself, e.g. the blocks buffered to train a zstd
+    /// dictionary. Blocks in flight to a dedicated thread are not accounted for.
+    pub fn mem_usage(&self) -> usize {
+        self.mem_usage.load(Ordering::Relaxed)
     }
 
     pub fn compress_block_and_write(
@@ -44,7 +57,7 @@ impl BlockCompressor {
         bytes: &[u8],
         num_docs_in_block: u32,
     ) -> io::Result<()> {
-        match &mut self.0 {
+        match &mut self.variants {
             BlockCompressorVariants::SameThread(block_compressor) => {
                 block_compressor.compress_block_and_write(bytes, num_docs_in_block)?;
             }
@@ -57,7 +70,7 @@ impl BlockCompressor {
     }
 
     pub fn stack_reader(&mut self, store_reader: StoreReader) -> io::Result<()> {
-        match &mut self.0 {
+        match &mut self.variants {
             BlockCompressorVariants::SameThread(block_compressor) => {
                 block_compressor.stack(store_reader)?;
             }
@@ -69,8 +82,7 @@ impl BlockCompressor {
     }
 
     pub fn close(self) -> io::Result<()> {
-        let imp = self.0;
-        match imp {
+        match self.variants {
             BlockCompressorVariants::SameThread(block_compressor) => block_compressor.close(),
             BlockCompressorVariants::DedicatedThread(different_thread_block_compressor) => {
                 different_thread_block_compressor.close()
@@ -88,6 +100,7 @@ struct BlockCompressorImpl {
     /// `Some` iff the compressor trains a zstd dictionary.
     #[cfg(feature = "zstd-compression")]
     zstd_dict: Option<ZstdDictState>,
+    mem_usage: Arc<AtomicUsize>,
 }
 
 impl BlockCompressorImpl {
@@ -100,7 +113,18 @@ impl BlockCompressorImpl {
             writer: CountingWriter::wrap(writer),
             #[cfg(feature = "zstd-compression")]
             zstd_dict: ZstdDictState::for_compressor(compressor)?,
+            mem_usage: Arc::default(),
         })
+    }
+
+    #[cfg(feature = "zstd-compression")]
+    fn update_mem_usage(&self) {
+        let mem_usage = match &self.zstd_dict {
+            Some(ZstdDictState::Sampling(sample)) => sample.mem_usage(),
+            Some(ZstdDictState::Ready(Some(encoder))) => encoder.mem_usage(),
+            Some(ZstdDictState::Ready(None)) | None => 0,
+        };
+        self.mem_usage.store(mem_usage, Ordering::Relaxed);
     }
 
     fn compress_block_and_write(&mut self, data: &[u8], num_docs_in_block: u32) -> io::Result<()> {
@@ -111,6 +135,8 @@ impl BlockCompressorImpl {
                 sample.push(data, num_docs_in_block);
                 if sample.is_complete() {
                     self.finish_dict_sampling()?;
+                } else {
+                    self.update_mem_usage();
                 }
                 return Ok(());
             }
@@ -152,13 +178,25 @@ impl BlockCompressorImpl {
         let Compressor::Zstd(zstd_compressor) = self.compressor else {
             unreachable!("only zstd compressors train a dictionary");
         };
-        let (encoder, compressed_blocks) =
-            sample.train_and_compress(zstd_compressor.compression_level)?;
-        for (compressed_block, num_docs_in_block) in compressed_blocks {
-            self.intermediary_buffer = compressed_block;
-            self.write_intermediary_buffer(num_docs_in_block)?;
-        }
+        let encoder = match sample.train_and_compress(zstd_compressor.compression_level)? {
+            Some((encoder, compressed_blocks)) => {
+                for (compressed_block, num_docs_in_block) in compressed_blocks {
+                    self.intermediary_buffer = compressed_block;
+                    self.write_intermediary_buffer(num_docs_in_block)?;
+                }
+                Some(encoder)
+            }
+            None => {
+                for (block, num_docs_in_block) in sample.blocks() {
+                    self.compressor
+                        .compress_into(block, &mut self.intermediary_buffer)?;
+                    self.write_intermediary_buffer(num_docs_in_block)?;
+                }
+                None
+            }
+        };
         self.zstd_dict = Some(ZstdDictState::Ready(encoder));
+        self.update_mem_usage();
         Ok(())
     }
 
@@ -262,6 +300,10 @@ const MIN_NUM_TRAINING_SAMPLES: usize = 100;
 /// A dictionary is kept only if it saves at least 1/MIN_DICT_GAIN_RATIO of the size.
 #[cfg(feature = "zstd-compression")]
 const MIN_DICT_GAIN_RATIO: usize = 50;
+/// Memory used by zstd's dictionary trainer: with its default parameters, fastCover allocates
+/// tables of 4 MiB, 4 MiB and 2 MiB, plus a compression context to evaluate dictionaries.
+#[cfg(feature = "zstd-compression")]
+const TRAINER_MEM_USAGE: usize = 12 << 20;
 
 #[cfg(feature = "zstd-compression")]
 enum ZstdDictState {
@@ -310,8 +352,26 @@ impl DictSample {
     }
 
     fn push(&mut self, block: &[u8], num_docs_in_block: u32) {
+        let needed = self.data.len() + block.len();
+        if needed > self.data.capacity() {
+            // Grow geometrically, but never beyond the sample target.
+            let capacity = (self.data.capacity() * 2).clamp(needed, self.target_len.max(needed));
+            self.data.reserve_exact(capacity - self.data.len());
+        }
         self.data.extend_from_slice(block);
         self.blocks.push((block.len(), num_docs_in_block));
+    }
+
+    /// Memory held by the sample, plus the memory needed to train a dictionary on it once it
+    /// is big enough: first the trainer's tables, then a compressed copy of the sample. The
+    /// encoder itself is accounted for once it exists (see `ZstdDictEncoder::mem_usage`).
+    fn mem_usage(&self) -> usize {
+        let buffers = self.data.capacity() + self.blocks.capacity() * size_of::<(usize, u32)>();
+        if self.data.len() < self.dict_size * MIN_SAMPLE_SIZE_RATIO {
+            return buffers;
+        }
+        let compressed_copy = zstd::zstd_safe::compress_bound(self.data.len());
+        buffers + TRAINER_MEM_USAGE.max(compressed_copy)
     }
 
     fn is_complete(&self) -> bool {
@@ -344,48 +404,48 @@ impl DictSample {
         ZstdDictEncoder::new(dict, compression_level).ok()
     }
 
-    /// Returns the encoder to use for the store, if any, and the buffered blocks compressed
-    /// accordingly.
+    /// Trains a dictionary and returns its encoder together with the buffered blocks compressed
+    /// with it, or `None` if the store should use plain zstd blocks.
     ///
     /// The dictionary is kept only if it makes the buffered blocks significantly smaller. An
     /// incomplete sample holds the whole store, so the size of the dictionary itself is then
     /// accounted for too.
     #[allow(clippy::type_complexity)]
     fn train_and_compress(
-        self,
+        &self,
         compression_level: Option<i32>,
-    ) -> io::Result<(Option<ZstdDictEncoder>, Vec<(Vec<u8>, u32)>)> {
-        let compress_all = |compress: &mut dyn FnMut(&[u8], &mut Vec<u8>) -> io::Result<()>| {
-            self.blocks()
-                .map(|(block, num_docs)| {
-                    let mut compressed = Vec::new();
-                    compress(block, &mut compressed)?;
-                    Ok((compressed, num_docs))
-                })
-                .collect::<io::Result<Vec<_>>>()
-        };
-        let total_len = |blocks: &[(Vec<u8>, u32)]| -> usize {
-            blocks.iter().map(|(block, _)| block.len()).sum()
-        };
-        let plain_blocks = compress_all(&mut |block, compressed| {
-            super::compression_zstd_block::compress(block, compressed, compression_level)
-        })?;
+    ) -> io::Result<Option<(ZstdDictEncoder, Vec<(Vec<u8>, u32)>)>> {
         let Some(mut encoder) = self.train(compression_level) else {
-            return Ok((None, plain_blocks));
+            return Ok(None);
         };
-        let dict_blocks =
-            compress_all(&mut |block, compressed| encoder.compress(block, compressed))?;
+        let mut compressed = Vec::new();
+        let mut without_dict = 0;
+        for (block, _) in self.blocks() {
+            super::compression_zstd_block::compress(block, &mut compressed, compression_level)?;
+            without_dict += compressed.len();
+        }
+        let dict_blocks = self
+            .blocks()
+            .map(|(block, num_docs)| {
+                let mut compressed = Vec::new();
+                encoder.compress(block, &mut compressed)?;
+                Ok((compressed, num_docs))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let dict_overhead = if self.is_complete() {
             0
         } else {
             encoder.dict().len()
         };
-        let with_dict = total_len(&dict_blocks) + dict_overhead;
-        let without_dict = total_len(&plain_blocks);
+        let with_dict = dict_blocks
+            .iter()
+            .map(|(block, _)| block.len())
+            .sum::<usize>()
+            + dict_overhead;
         if with_dict + without_dict / MIN_DICT_GAIN_RATIO < without_dict {
-            Ok((Some(encoder), dict_blocks))
+            Ok(Some((encoder, dict_blocks)))
         } else {
-            Ok((None, plain_blocks))
+            Ok(None)
         }
     }
 }

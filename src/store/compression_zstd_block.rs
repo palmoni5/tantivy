@@ -119,6 +119,12 @@ impl ZstdDictEncoder {
         self.dict
     }
 
+    /// Memory held by the encoder: the dictionary, prepared for compression, and the
+    /// compression context.
+    pub fn mem_usage(&self) -> usize {
+        self.dict.capacity() + self.cdict.sizeof() + self.cctx.sizeof()
+    }
+
     pub fn compress(&mut self, uncompressed: &[u8], compressed: &mut Vec<u8>) -> io::Result<()> {
         let ZstdDictEncoder { cdict, cctx, .. } = self;
         compress_with(uncompressed, compressed, |src, dst| {
